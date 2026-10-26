@@ -1,0 +1,182 @@
+import os
+import numpy as np
+import pandas as pd
+import matplotlib
+matplotlib.use("Agg")   # guarda los gráficos como imagen, sin abrir ventanas
+import matplotlib.pyplot as plt
+from sklearn.linear_model import LinearRegression
+from sklearn.dummy import DummyRegressor
+from sklearn.model_selection import LeaveOneGroupOut, LeaveOneOut, cross_val_predict
+
+pd.set_option("display.max_columns", None)
+pd.set_option("display.width", 200)
+
+# ---------- CONFIGURACIÓN ----------
+# archivo -> nombre de la temporada (ajustá los nombres de archivo a los tuyos)
+ARCHIVOS = {
+    "E0.csv.csv": "2024/25",
+    "E0_2324.csv.csv": "2023/24",
+    "E0_2223.csv.csv": "2022/23",
+}
+
+carpeta = os.path.dirname(os.path.abspath(__file__))
+cols = ["Date", "HomeTeam", "AwayTeam", "FTHG", "FTAG", "HST", "AST"]
+
+# ---------- LECTURA DE FECHAS DE CUALQUIER FORMATO ----------
+def leer_fechas(serie):
+    s = serie.astype(str).str.strip()
+    es_iso = s.str.match(r"^\d{4}-\d{2}-\d{2}")
+    iso = pd.to_datetime(s.where(es_iso), format="ISO8601", errors="coerce")
+    dia_primero = pd.to_datetime(s.where(~es_iso), dayfirst=True,
+                                 format="mixed", errors="coerce")
+    return iso.fillna(dia_primero)
+
+# ---------- CARGA ----------
+temporadas = []
+for archivo, nombre in ARCHIVOS.items():
+    ruta = os.path.join(carpeta, archivo)
+    if not os.path.exists(ruta):
+        print("No encuentro:", archivo)
+        print("Archivos que hay en la carpeta:")
+        for n in os.listdir(carpeta):
+            print("  -", n)
+        raise SystemExit("Corregí el diccionario ARCHIVOS con los nombres reales.")
+    t = pd.read_csv(ruta)[cols].dropna().copy()
+    t["Date"] = leer_fechas(t["Date"])
+    t = t.dropna(subset=["Date"])
+    t["temporada"] = nombre
+    temporadas.append(t)
+    print(nombre, "->", len(t), "partidos")
+
+df = pd.concat(temporadas, ignore_index=True)
+
+# ---------- FORMATO "UNA FILA POR EQUIPO Y PARTIDO" ----------
+# Cada partido se cuenta dos veces: una desde cada equipo.
+def formato_largo(t):
+    local = pd.DataFrame({
+        "Date": t["Date"], "temporada": t["temporada"], "equipo": t["HomeTeam"],
+        "gf": t["FTHG"], "gc": t["FTAG"], "af": t["HST"], "ac": t["AST"],
+    })
+    visita = pd.DataFrame({
+        "Date": t["Date"], "temporada": t["temporada"], "equipo": t["AwayTeam"],
+        "gf": t["FTAG"], "gc": t["FTHG"], "af": t["AST"], "ac": t["HST"],
+    })
+    return pd.concat([local, visita], ignore_index=True)
+
+largo = formato_largo(df)
+print("\nFilas (equipo x partido):", len(largo))
+
+# ---------- RESUMEN POR EQUIPO ----------
+def resumen(datos):
+    g = datos.groupby("equipo").agg(
+        partidos=("gf", "size"),
+        gf=("gf", "sum"), gc=("gc", "sum"),
+        af=("af", "sum"), ac=("ac", "sum"),
+    )
+    g["conversion"] = g["gf"] / g["af"]
+    g["dif_goles"] = (g["gf"] - g["gc"]) / g["partidos"]
+    g["dif_arco"] = (g["af"] - g["ac"]) / g["partidos"]
+    g["af_pp"] = g["af"] / g["partidos"]      # tiros al arco a favor por partido
+    g["ac_pp"] = g["ac"] / g["partidos"]      # tiros al arco en contra por partido
+    return g
+
+# ---------- CADA TEMPORADA EN DOS MITADES ----------
+filas = []
+for nombre, t in largo.groupby("temporada"):
+    mitad = t["Date"].median()
+    r1 = resumen(t[t["Date"] <= mitad])
+    r2 = resumen(t[t["Date"] > mitad])
+    union = r1.join(r2, lsuffix="_1", rsuffix="_2", how="inner")
+    union["temporada"] = nombre
+    filas.append(union)
+
+datos = pd.concat(filas)
+print("Equipos-temporada analizados:", len(datos))
+print("Partidos promedio por mitad:", round(datos["partidos_1"].mean(), 1))
+
+# ---------- ¿QUÉ SE MANTIENE ENTRE MITADES? ----------
+c_conv = datos["conversion_1"].corr(datos["conversion_2"])
+c_af = datos["af_pp_1"].corr(datos["af_pp_2"])
+c_ac = datos["ac_pp_1"].corr(datos["ac_pp_2"])
+
+print("\n--- Estabilidad entre 1ra y 2da mitad (correlación) ---")
+print("Conversión de goles:      ", round(c_conv, 2))
+print("Tiros al arco a favor:    ", round(c_af, 2))
+print("Tiros al arco en contra:  ", round(c_ac, 2))
+
+print("\nConversión de goles, temporada por temporada:")
+for nombre, g in datos.groupby("temporada"):
+    print(" ", nombre, round(g["conversion_1"].corr(g["conversion_2"]), 2))
+
+# ---------- ¿QUÉ PREDICE MEJOR LA DIF. DE GOLES DE LA 2DA MITAD? ----------
+print("\n--- Predictores de la dif. de goles de la 2da mitad ---")
+print("Dif. de goles 1ra mitad:        ", round(datos["dif_goles_1"].corr(datos["dif_goles_2"]), 2))
+print("Dif. de tiros al arco 1ra mitad:", round(datos["dif_arco_1"].corr(datos["dif_goles_2"]), 2))
+
+# ---------- MODELO ----------
+y = datos["dif_goles_2"]
+grupos = datos["temporada"]
+cv = LeaveOneGroupOut() if grupos.nunique() >= 2 else LeaveOneOut()
+
+def probar(modelo, columnas):
+    pred = cross_val_predict(modelo, datos[columnas], y, cv=cv, groups=grupos)
+    return np.abs(pred - y).mean()
+
+errores = {
+    "Sin modelo\n(promedio)": probar(DummyRegressor(), ["dif_arco_1"]),
+    "Dif. de goles": probar(LinearRegression(), ["dif_goles_1"]),
+    "Dif. de tiros\nal arco": probar(LinearRegression(), ["dif_arco_1"]),
+    "Ambas": probar(LinearRegression(), ["dif_goles_1", "dif_arco_1"]),
+}
+
+print("\n--- Modelo (error promedio en goles, menor es mejor) ---")
+base = errores["Sin modelo\n(promedio)"]
+for nombre, e in errores.items():
+    mejora = (1 - e / base) * 100
+    print(f"{nombre.replace(chr(10), ' '):<28} {e:.2f}   (mejora vs. sin modelo: {mejora:.0f}%)")
+
+# ---------- GRÁFICO 1: ¿QUÉ SE MANTIENE EN EL TIEMPO? ----------
+def dispersion(ax, x, y, titulo, xlab, ylab):
+    ax.scatter(x, y, alpha=0.7, color="#2a6fdb")
+    m, b = np.polyfit(x, y, 1)
+    xs = np.linspace(x.min(), x.max(), 50)
+    ax.plot(xs, m * xs + b, linestyle="--", color="#555555")
+    r = np.corrcoef(x, y)[0, 1]
+    ax.set_title(f"{titulo}\ncorrelación = {r:.2f}", fontsize=11)
+    ax.set_xlabel(xlab)
+    ax.set_ylabel(ylab)
+    ax.grid(alpha=0.25)
+
+fig, ejes = plt.subplots(1, 2, figsize=(11, 4.8))
+dispersion(ejes[0], datos["conversion_1"].values, datos["conversion_2"].values,
+           "Conversión de goles (goles / tiros al arco)",
+           "1ra mitad de la temporada", "2da mitad de la temporada")
+dispersion(ejes[1], datos["af_pp_1"].values, datos["af_pp_2"].values,
+           "Tiros al arco a favor por partido",
+           "1ra mitad de la temporada", "2da mitad de la temporada")
+fig.suptitle("Premier League 2022/23 a 2024/25: ¿qué métrica se mantiene en el tiempo?\n"
+             "Cada punto es un equipo en una temporada", fontsize=12)
+fig.tight_layout()
+fig.savefig(os.path.join(carpeta, "grafico_estabilidad.png"), dpi=200)
+plt.close(fig)
+
+# ---------- GRÁFICO 2: ERROR DE LOS MODELOS ----------
+fig, ax = plt.subplots(figsize=(8, 4.8))
+nombres = list(errores.keys())
+valores = list(errores.values())
+colores = ["#aaaaaa"] + ["#2a6fdb"] * (len(valores) - 1)
+barras = ax.bar(nombres, valores, color=colores)
+for barra, v in zip(barras, valores):
+    ax.text(barra.get_x() + barra.get_width() / 2, v + 0.01, f"{v:.2f}",
+            ha="center", fontsize=10)
+ax.set_ylabel("Error promedio (goles de diferencia)")
+ax.set_title("Predecir la 2da mitad de la temporada con datos de la 1ra\n"
+             "(menor es mejor; se prueba con temporadas que el modelo no vio)", fontsize=11)
+ax.grid(axis="y", alpha=0.25)
+fig.tight_layout()
+fig.savefig(os.path.join(carpeta, "grafico_modelos.png"), dpi=200)
+plt.close(fig)
+
+print("\nListo. Se guardaron en la carpeta del proyecto:")
+print("  - grafico_estabilidad.png")
+print("  - grafico_modelos.png")
